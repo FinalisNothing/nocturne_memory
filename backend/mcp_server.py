@@ -326,26 +326,26 @@ async def _generate_memory_index_view() -> str:
             nid = item.get("node_uuid", "")
             node_groups.setdefault(nid, []).append(item)
 
-        # --- Step 2: Pick primary path per node, collect aliases ---
-        # Primary = lowest priority value → shortest path → alphabetical URI.
-        entries = []  # list of (primary_item, [alias_items])
+        # --- Step 2: Pick primary path per node ---
+        # Primary = shortest depth → lowest priority value → alphabetical URI.
+        entries = []  # list of primary_item
         for _nid, items in node_groups.items():
-            items.sort(key=lambda x: (x.get("priority", 0), len(x["path"]), x.get("uri", "")))
-            entries.append((items[0], items[1:]))
+            items.sort(key=lambda x: (x["path"].count("/"), x.get("priority", 0), len(x["path"]), x.get("uri", "")))
+            entries.append(items[0])
 
         # --- Step 3: Organise primaries by domain → top-level segment ---
         domains: Dict[str, Dict[str, list]] = {}
-        for primary, aliases in entries:
+        for primary in entries:
             domain = primary.get("domain", DEFAULT_DOMAIN)
             domains.setdefault(domain, {})
             top_level = primary["path"].split("/")[0] if primary["path"] else "(root)"
-            domains[domain].setdefault(top_level, []).append((primary, aliases))
+            domains[domain].setdefault(top_level, []).append(primary)
 
         # --- Step 4: Render ---
         lines = [
             "# Memory Index",
             f"# Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            f"# Total: {len(node_groups)} nodes, {len(paths)} paths",
+            f"# Total: {len(node_groups)} unique nodes (aliases hidden for clarity)",
             "# Legend: [#ID] = Memory ID, [★N] = priority (lower = higher)",
             "",
         ]
@@ -358,18 +358,15 @@ async def _generate_memory_index_view() -> str:
 
             for group_name in sorted(domains[domain_name].keys()):
                 lines.append(f"## {group_name}")
-                for primary, aliases in sorted(
+                for primary in sorted(
                     domains[domain_name][group_name],
-                    key=lambda x: x[0]["path"],
+                    key=lambda x: x["path"],
                 ):
                     uri = primary.get("uri", make_uri(domain_name, primary["path"]))
                     priority = primary.get("priority", 0)
                     memory_id = primary.get("memory_id", "?")
                     imp_str = f" [★{priority}]" if priority > 0 else ""
                     lines.append(f"  - {uri} [#{memory_id}]{imp_str}")
-                    if aliases:
-                        alias_strs = [a.get("uri", make_uri(a["domain"], a["path"])) for a in aliases]
-                        lines.append(f"    aliases: {', '.join(alias_strs)}")
                 lines.append("")
 
         return "\n".join(lines)
@@ -768,6 +765,7 @@ async def add_alias(
 
     Use this to increase a memory's reachability via multiple URIs.
     Aliases can even cross domains (e.g., link a writer draft to a core memory).
+    新增别名时系统会自动在其下级联映射所有子树，原路径保持不变。
 
     Args:
         new_uri: New URI to create (alias)
