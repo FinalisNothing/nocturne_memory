@@ -1,403 +1,324 @@
 """
-Snapshot Manager for Selective Rollback
+Changeset Store — Single-pool accumulation of row-level before/after states.
 
-This module implements a snapshot system that allows the human to review and
-selectively roll back the AI's database operations.
+Overwrite semantics:
+  - First touch of a PK: record both `before` (pre-AI) and `after` (post-AI).
+  - Subsequent touches of the same PK: overwrite `after` only; `before` is frozen.
+  - Net-zero changes (before == after) are filtered from display automatically.
 
-Design Principles:
-1. Snapshots are taken BEFORE the first modification to a resource in a session
-2. Multiple modifications to the same resource in one session share ONE snapshot
-3. Rollback creates a NEW version with snapshot content (preserves version chain)
-4. Session-based organization for easy cleanup
-
-    Storage Structure:
-    snapshots/
-    └── {session_id}/
-        ├── manifest.json          # Session metadata and resource index
-        └── resources/
-            └── {safe_resource_id}.json
+Storage: one JSON file at `snapshots/changeset.json`.
 """
 
 import os
 import json
-import hashlib
-import shutil
 import stat
-from datetime import datetime
 from typing import Optional, Dict, Any, List
 from pathlib import Path
 
 
-# Default snapshot directory (relative to workspace root)
 DEFAULT_SNAPSHOT_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-    "snapshots"
+    "snapshots",
 )
 
+_CHANGESET_FILENAME = "changeset.json"
 
-def _handle_remove_readonly(func, path, exc_info):
-    """Make read-only files writable before retrying removal."""
-    exc_type, exc_value, _ = exc_info
-    if issubclass(exc_type, PermissionError):
-        try:
-            os.chmod(path, stat.S_IWRITE)
-        except OSError:
-            pass
-        func(path)
+TABLE_ORDER = ["nodes", "memories", "edges", "paths"]
+TABLE_PKS = {
+    "nodes": "uuid",
+    "memories": "id",
+    "edges": "id",
+    "paths": ("domain", "path"),
+}
+
+
+def _make_row_key(table: str, row: Dict[str, Any]) -> str:
+    pk_def = TABLE_PKS[table]
+    if isinstance(pk_def, tuple):
+        pk_val = "|".join(str(row[k]) for k in pk_def)
     else:
-        raise exc_value
+        pk_val = str(row[pk_def])
+    return f"{table}:{pk_val}"
 
 
-def _force_remove(path: str):
-    """Delete files or directories regardless of read-only attributes."""
-    if not os.path.exists(path):
-        return
-    if os.path.isdir(path):
-        shutil.rmtree(path, onerror=_handle_remove_readonly)
-    else:
-        try:
-            os.remove(path)
-        except PermissionError:
-            os.chmod(path, stat.S_IWRITE)
-            os.remove(path)
-        except FileNotFoundError:
-            pass
+def _rows_equal(a: Optional[dict], b: Optional[dict]) -> bool:
+    if a is None and b is None:
+        return True
+    if a is None or b is None:
+        return False
+    return a == b
 
 
-class SnapshotManager:
+class ChangesetStore:
     """
-    Manages snapshots for selective rollback functionality.
-    
-    Each session (typically one agent task/conversation) has its own snapshot space.
-    Within a session, each resource gets at most ONE snapshot - the state before
-    the first modification.
+    Accumulates row-level before/after states in a single pool.
+
+    The review page reads the frozen `before` and queries live DB state
+    to present the user with a clean delta and compute rollback paths.
     """
-    
+
     def __init__(self, snapshot_dir: Optional[str] = None):
         self.snapshot_dir = snapshot_dir or DEFAULT_SNAPSHOT_DIR
-        self._ensure_dir_exists(self.snapshot_dir)
-    
-    @staticmethod
-    def _ensure_dir_exists(path: str):
-        """Create directory if it doesn't exist."""
-        Path(path).mkdir(parents=True, exist_ok=True)
-    
-    @staticmethod
-    def _sanitize_resource_id(resource_id: str) -> str:
-        """
-        Convert a resource_id to a safe filename.
-        
-        Resource IDs like URIs "core://path/to/memory" need sanitization.
-        We use a deterministic hash suffix for uniqueness to prevent collisions
-        (e.g. "core://a/b" vs "core://a_b") while keeping readability.
-        """
-        # Calculate hash of the ORIGINAL resource_id for uniqueness
-        # This prevents "core://a/b" and "core://a_b" from colliding regardless of sanitization
-        id_hash = hashlib.md5(resource_id.encode()).hexdigest()[:8]
+        Path(self.snapshot_dir).mkdir(parents=True, exist_ok=True)
 
-        # Replace problematic characters
-        # 1. Handle protocol separator specifically for better readability
-        safe_id = resource_id.replace("://", "__")
-        
-        # 2. Replace remaining colons, slashes, and backslashes
-        safe_id = safe_id.replace(":", "_").replace("/", "_").replace("\\", "_")
-        
-        # 3. Replace relation arrow
-        safe_id = safe_id.replace(">", "_to_")
-        
-        # Truncate if too long (keeping enough distinct chars + hash)
-        # Windows max path is ~260 chars. We leave plenty of buffer.
-        if len(safe_id) > 100:
-            safe_id = safe_id[:100]
-        
-        # Always append hash to guarantee uniqueness
-        return f"{safe_id}_{id_hash}"
-    
-    def _get_session_dir(self, session_id: str) -> str:
-        """Get the directory path for a session."""
-        return os.path.join(self.snapshot_dir, session_id)
-    
-    def _get_resources_dir(self, session_id: str) -> str:
-        """Get the resources subdirectory for a session."""
-        return os.path.join(self._get_session_dir(session_id), "resources")
-    
-    def _get_manifest_path(self, session_id: str) -> str:
-        """Get the manifest file path for a session."""
-        return os.path.join(self._get_session_dir(session_id), "manifest.json")
-    
-    def _get_snapshot_path(self, session_id: str, resource_id: str) -> str:
-        """Get the snapshot file path for a specific resource."""
-        safe_id = self._sanitize_resource_id(resource_id)
-        return os.path.join(self._get_resources_dir(session_id), f"{safe_id}.json")
-    
-    def _load_manifest(self, session_id: str) -> Dict[str, Any]:
-        """Load or create session manifest."""
-        manifest_path = self._get_manifest_path(session_id)
-        
-        if os.path.exists(manifest_path):
-            with open(manifest_path, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        
-        return {
-            "session_id": session_id,
-            "created_at": datetime.now().isoformat(),
-            "resources": {}  # resource_id -> metadata
-        }
-    
-    def _save_manifest(self, session_id: str, manifest: Dict[str, Any]):
-        """Save session manifest."""
-        self._ensure_dir_exists(self._get_session_dir(session_id))
-        manifest_path = self._get_manifest_path(session_id)
-        
-        with open(manifest_path, 'w', encoding='utf-8') as f:
-            json.dump(manifest, f, ensure_ascii=False, indent=2)
-    
-    def has_snapshot(self, session_id: str, resource_id: str) -> bool:
-        """Check if a snapshot exists for this resource in this session."""
-        # Check manifest first (handles legacy snapshots with different filename formats)
-        manifest = self._load_manifest(session_id)
-        if resource_id in manifest.get("resources", {}):
-            return True
-        
-        # Fallback to file existence check
-        snapshot_path = self._get_snapshot_path(session_id, resource_id)
-        return os.path.exists(snapshot_path)
-    
-    def find_memory_snapshot_by_uri(self, session_id: str, uri: str) -> Optional[str]:
-        """
-        Find an existing memory content snapshot for a given URI.
-        
-        When a memory is updated multiple times in one session, each update
-        creates a new memory_id (version chain: id=1 → id=5 → id=12 → ...).
-        The snapshot resource_id is "memory:{id}", so a naive has_snapshot()
-        check on the new id misses the existing snapshot for the old id.
-        
-        This method scans the manifest for any "memory" type snapshot whose
-        stored URI matches the given one, ensuring only ONE content snapshot
-        per URI per session regardless of how many updates occur.
-        
-        Args:
-            session_id: Session identifier
-            uri: The memory URI (e.g. "core://foo/bar")
-            
-        Returns:
-            The resource_id of the existing snapshot (e.g. "memory:1"),
-            or None if no matching snapshot exists.
-        """
-        manifest = self._load_manifest(session_id)
-        for resource_id, meta in manifest.get("resources", {}).items():
-            if (meta.get("resource_type") == "memory"
-                    and meta.get("uri") == uri):
-                return resource_id
-        return None
-    
-    def create_snapshot(
+    @property
+    def _changeset_path(self) -> str:
+        return os.path.join(self.snapshot_dir, _CHANGESET_FILENAME)
+
+    def _load(self) -> Dict[str, Any]:
+        p = self._changeset_path
+        if os.path.exists(p):
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if "rows" not in data:
+                return {"rows": {}}
+            return data
+        return {"rows": {}}
+
+    def _save(self, data: Dict[str, Any]):
+        p = self._changeset_path
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    # ------------------------------------------------------------------
+    # Core: record with overwrite semantics
+    # ------------------------------------------------------------------
+
+    def record(
         self,
-        session_id: str,
-        resource_id: str,
-        resource_type: str,
-        snapshot_data: Dict[str, Any],
-        force: bool = False
-    ) -> bool:
+        table: str,
+        row_before: Optional[Dict[str, Any]],
+        row_after: Optional[Dict[str, Any]],
+    ):
         """
-        Create a snapshot for a resource.
-        
-        IMPORTANT: This should be called BEFORE any modification.
-        If a snapshot already exists for this resource in this session,
-        this call is a no-op (returns False) unless force=True.
-        
-        Args:
-            session_id: Unique session identifier
-            resource_id: Resource identifier (e.g., memory URI)
-            resource_type: Resource type (e.g., 'memory')
-            snapshot_data: The complete resource state to snapshot
-            force: If True, overwrite any existing snapshot for this resource.
-                   Used by delete operations to ensure the final snapshot
-                   reflects the delete rather than an earlier modify.
-            
-        Returns:
-            True if snapshot was created, False if it already existed (and force=False)
-        """
-        # Check if snapshot already exists
-        if not force and self.has_snapshot(session_id, resource_id):
-            return False
-        
-        # Ensure directories exist
-        self._ensure_dir_exists(self._get_resources_dir(session_id))
-        
-        # Create snapshot file
-        snapshot = {
-            "resource_id": resource_id,
-            "resource_type": resource_type,
-            "snapshot_time": datetime.now().isoformat(),
-            "data": snapshot_data
-        }
-        
-        snapshot_path = self._get_snapshot_path(session_id, resource_id)
-        with open(snapshot_path, 'w', encoding='utf-8') as f:
-            json.dump(snapshot, f, ensure_ascii=False, indent=2)
-        
-        # Update manifest
-        manifest = self._load_manifest(session_id)
-        manifest["resources"][resource_id] = {
-            "resource_type": resource_type,
-            "snapshot_time": snapshot["snapshot_time"],
-            "operation_type": snapshot_data.get("operation_type", "modify"),
-            "file": os.path.basename(snapshot_path),
-            "uri": snapshot_data.get("uri")  # For display (path snapshots use URI as resource_id; memory snapshots store it in data)
-        }
-        self._save_manifest(session_id, manifest)
-        
-        return True
-    
-    def get_snapshot(self, session_id: str, resource_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Retrieve a snapshot for a resource.
-        
-        Returns:
-            The snapshot data, or None if not found
-        """
-        # First, check manifest for the actual filename (handles legacy snapshots)
-        manifest = self._load_manifest(session_id)
-        resource_meta = manifest.get("resources", {}).get(resource_id)
-        
-        if resource_meta and resource_meta.get("file"):
-            # Use the filename recorded in manifest
-            snapshot_path = os.path.join(
-                self._get_resources_dir(session_id), 
-                resource_meta["file"]
-            )
-        else:
-            # Fallback to computed path (for forward compatibility)
-            snapshot_path = self._get_snapshot_path(session_id, resource_id)
-        
-        if not os.path.exists(snapshot_path):
-            return None
-        
-        with open(snapshot_path, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    
-    def list_sessions(self) -> List[Dict[str, Any]]:
-        """
-        List all sessions with snapshots.
-        
-        Returns:
-            List of session metadata (id, created_at, resource_count)
-        """
-        sessions = []
-        
-        if not os.path.exists(self.snapshot_dir):
-            return sessions
-        
-        for session_id in os.listdir(self.snapshot_dir):
-            session_dir = self._get_session_dir(session_id)
-            if os.path.isdir(session_dir):
-                manifest = self._load_manifest(session_id)
-                resource_count = len(manifest.get("resources", {}))
-                
-                # Auto-cleanup empty sessions
-                if resource_count == 0:
-                    self.clear_session(session_id)
-                    continue
+        Record one row change.
 
-                sessions.append({
-                    "session_id": session_id,
-                    "created_at": manifest.get("created_at"),
-                    "resource_count": resource_count
-                })
-        
-        # Sort by creation time (newest first)
-        sessions.sort(key=lambda x: x.get("created_at", ""), reverse=True)
-        return sessions
-    
-    def list_snapshots(self, session_id: str) -> List[Dict[str, Any]]:
+        First touch: store both `before` and `after`.
+        Subsequent: overwrite `after` only.
         """
-        List all snapshots in a session.
-        
-        Returns:
-            List of snapshot metadata (resource_id, resource_type, snapshot_time, operation_type)
-        """
-        manifest = self._load_manifest(session_id)
-        snapshots = []
-        
-        for resource_id, meta in manifest.get("resources", {}).items():
-            snapshots.append({
-                "resource_id": resource_id,
-                "resource_type": meta.get("resource_type"),
-                "snapshot_time": meta.get("snapshot_time"),
-                "operation_type": meta.get("operation_type", "modify"),
-                "uri": meta.get("uri")  # Display URI
-            })
-        
-        return snapshots
-    
-    def delete_snapshot(self, session_id: str, resource_id: str) -> bool:
-        """
-        Delete a specific snapshot.
-        
-        Returns:
-            True if deleted, False if not found
-        """
-        # First, check manifest for the actual filename (handles legacy snapshots)
-        manifest = self._load_manifest(session_id)
-        resource_meta = manifest.get("resources", {}).get(resource_id)
-        
-        if resource_meta and resource_meta.get("file"):
-            # Use the filename recorded in manifest
-            snapshot_path = os.path.join(
-                self._get_resources_dir(session_id), 
-                resource_meta["file"]
-            )
+        ref_row = row_before if row_before is not None else row_after
+        if ref_row is None:
+            return
+        key = _make_row_key(table, ref_row)
+
+        data = self._load()
+        existing = data["rows"].get(key)
+
+        if existing is not None:
+            # Keep net-zero (before=None, after=None) rows until GC runs.
+            # _gc_noop_creates() needs these anchors to sweep dependent
+            # create-only rows (nodes/memories/edges) in the same changeset.
+            existing["after"] = row_after
         else:
-            # Fallback to computed path
-            snapshot_path = self._get_snapshot_path(session_id, resource_id)
-        
-        if not os.path.exists(snapshot_path):
-            return False
-        
-        _force_remove(snapshot_path)
-        
-        # Update manifest
-        if resource_id in manifest.get("resources", {}):
-            del manifest["resources"][resource_id]
-            
-            # If no resources left, remove the entire session to prevent clutter
-            if not manifest["resources"]:
-                self.clear_session(session_id)
-            else:
-                self._save_manifest(session_id, manifest)
-        
-        return True
-    
-    def clear_session(self, session_id: str) -> int:
+            data["rows"][key] = {
+                "table": table,
+                "before": row_before,
+                "after": row_after,
+            }
+
+        self._gc_noop_creates(data)
+        if data.get("rows"):
+            self._save(data)
+        else:
+            self._remove_changeset()
+
+    def record_many(
+        self,
+        before_state: Dict[str, List[Dict[str, Any]]],
+        after_state: Dict[str, List[Dict[str, Any]]],
+    ):
         """
-        Delete all snapshots in a session.
-        
-        Returns:
-            Number of snapshots deleted
+        Batch-record changes across multiple tables.
+
+        Both arguments map table name -> list of row dicts.
+        Rows in `before_state` only = DELETE.
+        Rows in `after_state` only = INSERT.
+        Rows in both = UPDATE (matched by PK).
         """
-        session_dir = self._get_session_dir(session_id)
-        
-        if not os.path.exists(session_dir):
+        data = self._load()
+
+        all_tables = set(before_state.keys()) | set(after_state.keys())
+        for table in all_tables:
+            before_rows = {_make_row_key(table, r): r for r in before_state.get(table, [])}
+            after_rows = {_make_row_key(table, r): r for r in after_state.get(table, [])}
+
+            all_keys = set(before_rows.keys()) | set(after_rows.keys())
+            for key in all_keys:
+                b = before_rows.get(key)
+                a = after_rows.get(key)
+
+                existing = data["rows"].get(key)
+                if existing is not None:
+                    # Keep net-zero anchors for _gc_noop_creates().
+                    existing["after"] = a
+                else:
+                    data["rows"][key] = {
+                        "table": table,
+                        "before": b,
+                        "after": a,
+                    }
+
+        self._gc_noop_creates(data)
+        if data.get("rows"):
+            self._save(data)
+        else:
+            self._remove_changeset()
+
+    # ------------------------------------------------------------------
+    # Query
+    # ------------------------------------------------------------------
+
+    def get_change_count(self) -> int:
+        """Return the number of net-changed rows in the pool."""
+        data = self._load()
+        return len(self._changed_rows(data))
+
+    def get_changed_rows(self) -> List[Dict[str, Any]]:
+        """Return all rows where before != after (net changes only)."""
+        data = self._load()
+        return self._changed_rows(data)
+
+    def get_all_rows_dict(self) -> Dict[str, Any]:
+        """Return the full dictionary of rows (including unchanged) for resolving references."""
+        data = self._load()
+        return data.get("rows", {})
+
+    def get_changed_rows(self) -> List[Dict[str, Any]]:
+        """Return all rows where before != after (net changes only)."""
+        data = self._load()
+        return self._changed_rows(data)
+
+    def remove_keys(self, keys: List[str]) -> int:
+        """Remove specific tracked rows by their keys."""
+        if not keys:
             return 0
-        
-        # Count resources before deletion
-        manifest = self._load_manifest(session_id)
-        count = len(manifest.get("resources", {}))
-        
-        # Remove the entire session directory tree (manifest + resources)
-        _force_remove(session_dir)
-        
+            
+        data = self._load()
+        removed = 0
+        for k in keys:
+            if k in data["rows"]:
+                data["rows"].pop(k)
+                removed += 1
+                
+        remaining = self._changed_rows(data)
+        if not remaining:
+            self._remove_changeset()
+        elif removed > 0:
+            self._save(data)
+            
+        return removed
+
+    def clear_all(self) -> int:
+        """Clear the entire changeset pool (integrate all)."""
+        data = self._load()
+        count = len(self._changed_rows(data))
+        self._remove_changeset()
         return count
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _changed_rows(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        result = []
+        for entry in data.get("rows", {}).values():
+            if not _rows_equal(entry.get("before"), entry.get("after")):
+                result.append(entry)
+        return result
+
+    @staticmethod
+    def _gc_noop_creates(data: Dict[str, Any]) -> bool:
+        """Remove create-then-delete no-ops and their orphaned dependents.
+
+        A path that goes through create→delete in one changeset ends up
+        with before=None, after=None (net-zero).  Related node/memory/edge
+        entries created in the same changeset (before=None) lose their
+        path mapping and become invisible to the review UI while still
+        being counted as pending changes.  This sweeps them out.
+        """
+        rows = data.get("rows", {})
+        if not rows:
+            return False
+
+        net_zero = {
+            k for k, e in rows.items()
+            if e.get("before") is None and e.get("after") is None
+        }
+        if not net_zero:
+            return False
+
+        # Collect node_uuids still reachable from surviving path entries.
+        reachable = set()
+        for key, entry in rows.items():
+            if key in net_zero or not key.startswith("paths:"):
+                continue
+            ref = entry.get("after") or entry.get("before")
+            if not ref:
+                continue
+            edge_id = ref.get("edge_id")
+            if edge_id is not None:
+                ek = f"edges:{edge_id}"
+                ee = rows.get(ek)
+                if ee and ek not in net_zero:
+                    er = ee.get("after") or ee.get("before")
+                    if er and er.get("child_uuid"):
+                        reachable.add(er["child_uuid"])
+            if ref.get("node_uuid"):
+                reachable.add(ref["node_uuid"])
+
+        to_remove = set(net_zero)
+        for key, entry in rows.items():
+            if key in to_remove or entry.get("before") is not None:
+                continue
+            ref = entry.get("after")
+            if not ref:
+                continue
+
+            if key.startswith("nodes:"):
+                if ref.get("uuid") not in reachable:
+                    to_remove.add(key)
+            elif key.startswith("memories:"):
+                if ref.get("node_uuid") not in reachable:
+                    to_remove.add(key)
+            elif key.startswith("edges:"):
+                eid = ref.get("id")
+                if not any(
+                    k not in to_remove and k.startswith("paths:")
+                    and ((rows[k].get("after") or rows[k].get("before") or {}).get("edge_id") == eid)
+                    for k in rows
+                ):
+                    to_remove.add(key)
+
+        for key in to_remove:
+            rows.pop(key, None)
+        return True
+
+    def _remove_changeset(self):
+        p = self._changeset_path
+        try:
+            os.remove(p)
+        except FileNotFoundError:
+            pass
+        except PermissionError:
+            os.chmod(p, stat.S_IWRITE)
+            os.remove(p)
+
+
+def _parse_uri(uri: str):
+    if "://" in uri:
+        domain, path = uri.split("://", 1)
+    else:
+        domain, path = "core", uri
+    return domain, path
 
 
 # Global singleton
-_snapshot_manager: Optional[SnapshotManager] = None
+_store: Optional[ChangesetStore] = None
 
 
-def get_snapshot_manager() -> SnapshotManager:
-    """Get the global SnapshotManager instance."""
-    global _snapshot_manager
-    if _snapshot_manager is None:
-        _snapshot_manager = SnapshotManager()
-    return _snapshot_manager
+def get_changeset_store() -> ChangesetStore:
+    global _store
+    if _store is None:
+        _store = ChangesetStore()
+    return _store

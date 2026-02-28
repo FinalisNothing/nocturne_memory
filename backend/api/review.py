@@ -1,787 +1,716 @@
 """
-Review API - Selective Rollback for Database Changes (SQLite Backend)
+Review API — Grouped by node_uuid, with universal rollback.
 
-This module provides endpoints for the human to review and selectively rollback
-the AI's database modifications.
-
-Design Philosophy:
-- Snapshots are split into two dimensions matching the DB tables:
-  * PATH snapshots (resource_type="path"): track path creation/deletion/metadata changes
-  * MEMORY snapshots (resource_type="memory"): track content changes
-- This separation allows independent rollback of path vs content changes
-- Old versions are marked deprecated for review
-- The human can permanently delete deprecated memories after review
+This module provides endpoints for reviewing and rolling back changes made by the AI.
+Unlike traditional systems that track operations (e.g., "create", "update"), this system 
+groups physical row changes (nodes, memories, edges, paths) by their top-level `node_uuid`.
+This allows a "universal rollback" that dynamically inspects the `before` state of the 
+data and reverts it exactly as it was, eliminating edge cases from compound AI actions.
 """
 from fastapi import APIRouter, HTTPException
-from typing import List
-import difflib
-from urllib.parse import unquote
+from typing import List, Dict, Any, Optional
 
 from models import (
     DiffRequest, DiffResponse,
-    SessionInfo, SnapshotInfo, SnapshotDetail, ResourceDiff,
-    RollbackRequest, RollbackResponse
+    ChangeGroup, UriDiff,
+    GroupRollbackResponse,
 )
 from .utils import get_text_diff
-from db.snapshot import get_snapshot_manager
+from db.snapshot import get_changeset_store, _make_row_key
 from db.sqlite_client import get_db_client
 
 router = APIRouter(prefix="/review", tags=["review"])
 
 
-# ========== Session & Snapshot Endpoints ==========
-
-@router.get("/sessions", response_model=List[SessionInfo])
-async def list_sessions():
+def _resolve_node_uuid_sync(row: Dict[str, Any], all_rows: List[Dict[str, Any]], db_edge_to_node: Dict[int, str]) -> Optional[str]:
     """
-    列出所有有快照的 session
+    Resolve the top-level node_uuid for a given changeset row.
     
-    每个 MCP 服务器实例运行期间算作一个 session。
-    Session ID 格式: mcp_YYYYMMDD_HHMMSS_{random}
+    Since changes are recorded at the row level across 4 tables (nodes, memories, edges, paths),
+    this function traces foreign keys up the hierarchy to find the root node_uuid.
+    
+    Args:
+        row: The changeset row dict (containing table, before, and after states).
+        all_rows: All current rows in the changeset, used to trace path -> edge -> node.
+        db_edge_to_node: A pre-fetched cache mapping edge_id to child_uuid for edges 
+                         that exist in the live DB but aren't in the changeset.
+                         
+    Returns:
+        The resolved node_uuid as a string, or None if unresolvable.
     """
-    manager = get_snapshot_manager()
-    sessions = manager.list_sessions()
-    return [SessionInfo(**s) for s in sessions]
-
-
-@router.get("/sessions/{session_id}/snapshots", response_model=List[SnapshotInfo])
-async def list_session_snapshots(session_id: str):
-    """
-    列出指定 session 中的所有快照
-    
-    返回每个被修改过的资源的快照元信息。
-    """
-    manager = get_snapshot_manager()
-    snapshots = manager.list_snapshots(session_id)
-    
-    if not snapshots:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Session '{session_id}' not found or has no snapshots"
-        )
-    
-    return [SnapshotInfo(**s) for s in snapshots]
-
-
-@router.get("/sessions/{session_id}/snapshots/{resource_id:path}", response_model=SnapshotDetail)
-async def get_snapshot_detail(session_id: str, resource_id: str):
-    """
-    获取指定快照的详细数据
-    
-    resource_id 示例:
-    - Memory path: "nocturne", "nocturne/salem"
-    """
-    # Ensure resource_id is decoded (handling %2F and other encoded chars)
-    resource_id = unquote(resource_id)
-    
-    manager = get_snapshot_manager()
-    snapshot = manager.get_snapshot(session_id, resource_id)
-    
-    if not snapshot:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Snapshot for '{resource_id}' not found in session '{session_id}'"
-        )
-    
-    return SnapshotDetail(
-        resource_id=snapshot["resource_id"],
-        resource_type=snapshot["resource_type"],
-        snapshot_time=snapshot["snapshot_time"],
-        data=snapshot["data"]
-    )
-
-
-# ========== Diff Helpers ==========
-
-def _compute_diff(old_content: str, new_content: str) -> tuple:
-    """
-    计算两个文本的 diff
-    返回 (unified_diff, summary)
-    """
-    old_lines = old_content.splitlines(keepends=True)
-    new_lines = new_content.splitlines(keepends=True)
-    
-    diff = difflib.unified_diff(old_lines, new_lines, fromfile='snapshot', tofile='current')
-    unified = ''.join(diff)
-    
-    additions = sum(1 for line in unified.splitlines() if line.startswith('+') and not line.startswith('+++'))
-    deletions = sum(1 for line in unified.splitlines() if line.startswith('-') and not line.startswith('---'))
-    
-    if additions == 0 and deletions == 0:
-        summary = "No changes"
-    else:
-        summary = f"+{additions} / -{deletions} lines"
-    
-    return unified, summary
-
-
-async def _get_memory_by_path_from_data(data: dict):
-    """Helper: fetch current memory via path/domain stored in snapshot data."""
-    client = get_db_client()
-    path = data.get("path")
-    domain = data.get("domain", "core")
-    if not path:
+    table = row["table"]
+    # Use the 'before' state if it exists, otherwise fallback to 'after' state
+    ref = row["before"] if row["before"] else row["after"]
+    if not ref:
         return None
-    return await client.get_memory_by_path(path, domain)
-
-
-# ========== Diff: PATH snapshots ==========
-
-async def _diff_path_create(snapshot: dict, resource_id: str) -> dict:
-    """Diff for path creation (create_memory). Rollback = delete memory + path."""
-    snapshot_data = {"content": None, "priority": None, "disclosure": None}
-    current_memory = await _get_memory_by_path_from_data(snapshot["data"])
-    
-    if not current_memory:
-        current_data = {"content": "[DELETED]", "priority": None, "disclosure": None}
-        summary = "Created then deleted"
-        has_changes = False
-    else:
-        current_data = {
-            "content": current_memory.get("content", ""),
-            "priority": current_memory.get("priority"),
-            "disclosure": current_memory.get("disclosure")
-        }
-        line_count = len(current_data["content"].splitlines())
-        summary = f"Created: +{line_count} lines (rollback = delete)"
-        has_changes = True
-    
-    unified = f"--- /dev/null\n+++ {resource_id}\n"
-    if current_data["content"] and current_data["content"] != "[DELETED]":
-        for line in current_data["content"].splitlines():
-            unified += f"+{line}\n"
-    
-    return {"snapshot_data": snapshot_data, "current_data": current_data,
-            "unified": unified, "summary": summary, "has_changes": has_changes}
-
-
-async def _diff_path_create_alias(snapshot: dict, resource_id: str) -> dict:
-    """Diff for alias creation. Rollback = remove alias path only."""
-    target_uri = snapshot["data"].get("target_uri", "unknown")
-    snapshot_data = {"content": None, "priority": None, "disclosure": None}
-    
-    current_memory = await _get_memory_by_path_from_data(snapshot["data"])
-    
-    if not current_memory:
-        current_data = {"content": "[ALIAS REMOVED]", "priority": None, "disclosure": None}
-        summary = "Alias created then removed"
-        has_changes = False
-    else:
-        current_data = {
-            "content": current_memory.get("content", ""),
-            "priority": current_memory.get("priority"),
-            "disclosure": current_memory.get("disclosure")
-        }
-        summary = f"Alias created → {target_uri} (rollback = remove alias)"
-        has_changes = True
-    
-    unified = f"--- /dev/null\n+++ {resource_id} (alias → {target_uri})\n"
-    if current_data["content"] and current_data["content"] != "[ALIAS REMOVED]":
-        unified += f"+[Alias pointing to: {target_uri}]\n"
-    
-    return {"snapshot_data": snapshot_data, "current_data": current_data,
-            "unified": unified, "summary": summary, "has_changes": has_changes}
-
-
-async def _get_surviving_paths(client, memory_id: int) -> list:
-    """Follow the version chain from memory_id to the latest version,
-    then return all living paths pointing to that memory.
-    
-    This lets the human see whether a deleted path was just an alias
-    or the last remaining route to the memory content.
-    """
-    if not memory_id:
-        return []
-    
-    # Follow migrated_to chain to find the latest version
-    current_id = memory_id
-    visited = set()
-    while current_id and current_id not in visited:
-        visited.add(current_id)
-        version = await client.get_memory_version(current_id)
-        if not version or not version.get("migrated_to"):
-            break
-        current_id = version["migrated_to"]
-    
-    # Now get paths from the latest version
-    latest = await client.get_memory_version(current_id)
-    if latest:
-        return latest.get("paths", [])
-    
-    # Fallback: check original memory_id
-    original = await client.get_memory_version(memory_id)
-    return original.get("paths", []) if original else []
-
-
-async def _diff_path_delete(snapshot: dict, resource_id: str) -> dict:
-    """Diff for path deletion. Rollback = restore path.
-    
-    Old content is fetched from DB via memory_id rather than from the
-    snapshot file, leveraging the version chain.
-    Also includes surviving paths so the human can tell if this is just
-    an alias removal or if the entire memory is being discarded.
-    """
-    client = get_db_client()
-    
-    # --- Retrieve old content from DB ---
-    old_memory_id = snapshot["data"].get("memory_id")
-    old_version = await client.get_memory_version(old_memory_id) if old_memory_id else None
-    
-    if old_version:
-        old_content = old_version.get("content", "")
-    else:
-        old_content = "[已被永久删除，无法显示旧内容]"
-    
-    snapshot_data = {
-        "content": old_content,
-        "priority": snapshot["data"].get("priority", snapshot["data"].get("importance")),
-        "disclosure": snapshot["data"].get("disclosure")
-    }
-    
-    current_memory = await _get_memory_by_path_from_data(snapshot["data"])
-    
-    if not current_memory:
-        current_data = {"content": "[DELETED]", "priority": None, "disclosure": None}
-    else:
-        current_data = {
-            "content": current_memory.get("content", ""),
-            "priority": current_memory.get("priority"),
-            "disclosure": current_memory.get("disclosure")
-        }
-    
-    # --- Find surviving paths for this memory ---
-    surviving_paths = await _get_surviving_paths(client, old_memory_id)
-    # Exclude the deleted path itself from the list
-    deleted_uri = snapshot["data"].get("uri") or f"{snapshot['data'].get('domain', 'core')}://{snapshot['data'].get('path')}"
-    surviving_paths = [p for p in surviving_paths if p != deleted_uri]
-    
-    unified, summary = _compute_diff(snapshot_data["content"], current_data["content"])
-    
-    if current_data["content"] == "[DELETED]":
-        summary = "Deleted (rollback = restore)"
-    
-    current_data["surviving_paths"] = surviving_paths
-    
-    return {"snapshot_data": snapshot_data, "current_data": current_data,
-            "unified": unified, "summary": summary, "has_changes": True}
-
-
-async def _diff_path_modify_meta(snapshot: dict, resource_id: str) -> dict:
-    """Diff for path metadata change (priority/disclosure). Rollback = restore metadata."""
-    snapshot_data = {
-        "content": None,
-        "priority": snapshot["data"].get("priority", snapshot["data"].get("importance")),
-        "disclosure": snapshot["data"].get("disclosure")
-    }
-    
-    current_memory = await _get_memory_by_path_from_data(snapshot["data"])
-    
-    if not current_memory:
-        current_data = {"content": None, "priority": None, "disclosure": None}
-        summary = "Path no longer exists"
-        has_changes = False
-    else:
-        current_data = {
-            "content": None,
-            "priority": current_memory.get("priority"),
-            "disclosure": current_memory.get("disclosure")
-        }
         
-        meta_changes = []
-        for key in ["priority", "disclosure"]:
-            if snapshot_data.get(key) != current_data.get(key):
-                meta_changes.append(f"{key}: {snapshot_data.get(key)} → {current_data.get(key)}")
+    if table == "nodes":
+        return ref.get("uuid")
+    if table == "memories":
+        return ref.get("node_uuid")
+    if table == "edges":
+        return ref.get("child_uuid")
+    if table == "paths":
+        # Some paths (root paths) map directly to a node_uuid
+        if ref.get("node_uuid"):
+            return ref.get("node_uuid")
+            
+        edge_id = ref.get("edge_id")
+        if edge_id is not None:
+            # 1. Try to resolve edge_id -> child_uuid from within the changeset itself
+            for r in all_rows:
+                if r["table"] == "edges":
+                    eref = r["before"] if r["before"] else r["after"]
+                    if eref and eref.get("id") == edge_id and eref.get("child_uuid"):
+                        return eref.get("child_uuid")
+            # 2. If not in changeset, fallback to the pre-fetched live DB cache
+            return db_edge_to_node.get(edge_id)
+    return None
+
+
+def _get_causal_anchors(changed_rows: List[Dict[str, Any]], all_rows: List[Dict[str, Any]], db_edge_to_node: Dict[int, str]) -> Dict[str, str]:
+    """
+    计算每一行变更的“因果锚点 (Causal Anchor)”。
+    
+    由于底层是细粒度的行级记录（nodes, memories, edges, paths），
+    AI 的一个高层操作（如：删除某节点）往往会引发一连串的级联变动
+    （如：它的子路径全部被删、连向它的边被废弃、它的记忆被 GC 废弃等）。
+    
+    如果仅仅按照每一行自身外键指向的 `node_uuid` 来分组，会导致高层操作被
+    “撕裂”成好几个零碎的审核组，不仅增加审核负担，更会给用户留下
+    “只回滚了一半导致数据库外键结构断裂”的隐患。
+    
+    本函数的作用，就是在快照记录中逆向追踪这种“级联关系”：
+    如果记录 B 的发生是因为记录 A 导致的，那么 B 就会认 A 为“父因”，
+    并最终把 B 的变动“折叠（归属）”到 A 所属的最高层节点上去。
+    """
+    anchors = {}
+    row_by_key = {}
+    
+    paths_by_string = {}
+    incoming_edges = {}
+    
+    # =========================================================================
+    # 步骤 1：初步归属与索引构建 (Initial Assignment & Indexing)
+    # 遍历所有被改变的行，先计算出它自身“字面上”属于哪个 node_uuid。
+    # 同时建立快速查询字典，方便后续查找某条 path 或是某个节点的入边 (incoming edges)。
+    # =========================================================================
+    for row in changed_rows:
+        key = _make_row_key(row["table"], row["before"] if row["before"] else row["after"])
+        row_by_key[key] = row
         
-        if meta_changes:
-            summary = "Metadata: " + ", ".join(meta_changes)
-            has_changes = True
-        else:
-            summary = "No metadata changes"
-            has_changes = False
+        # 自身字面上的节点归属（比如 edge A->B，字面上属于 B）
+        node_uuid = _resolve_node_uuid_sync(row, all_rows, db_edge_to_node)
+        anchors[key] = node_uuid
+        
+        # 将 paths 按照 URI 字符串索引起来，方便查它的父级 path
+        if row["table"] == "paths":
+            ref = row["before"] if row["before"] else row["after"]
+            paths_by_string[f"{ref['domain']}://{ref['path']}"] = row
+            
+        # 将 edges 按照它指向的 child_uuid 索引起来，找“谁连向了我”
+        elif row["table"] == "edges":
+            ref = row["before"] if row["before"] else row["after"]
+            incoming_edges.setdefault(ref["child_uuid"], []).append(row)
+
+    # =========================================================================
+    # 步骤 2：构建因果指针网络 (Build Causal Parent Pointers)
+    # 为每一行数据寻找“导致它发生变动”的直接原因行，构建 parent_map。
+    # =========================================================================
+    parent_map = {}
     
-    return {"snapshot_data": snapshot_data, "current_data": current_data,
-            "unified": "", "summary": summary, "has_changes": has_changes}
+    # 辅助函数：判断两个操作是否是同一个方向的同类操作（要么都是被删，要么都是新建）
+    # 比如：父节点被删，子节点也被删，这叫方向一致，构成因果。
+    def is_deleted(r): return r["before"] is not None and r["after"] is None
+    def is_created(r): return r["before"] is None and r["after"] is not None
+    def same_action(r1, r2):
+        if is_deleted(r1) and is_deleted(r2): return True
+        if is_created(r1) and is_created(r2): return True
+        return False
+
+    for key, row in row_by_key.items():
+        if row["table"] == "paths":
+            # 场景 A：路径级联 (Path Cascades)
+            # 比如创建/删除 core://A/B 时，检查快照里有没有创建/删除 core://A
+            # 如果有，说明 B 的变化是被 A 顺带引发的。B 认 A 为父因。
+            ref = row["before"] if row["before"] else row["after"]
+            if "/" in ref["path"]:
+                parent_path = ref["path"].rsplit("/", 1)[0]
+                parent_uri = f"{ref['domain']}://{parent_path}"
+                parent_row = paths_by_string.get(parent_uri)
+                if parent_row and same_action(row, parent_row):
+                    parent_map[key] = _make_row_key("paths", parent_row["before"] if parent_row["before"] else parent_row["after"])
+                    
+        elif row["table"] == "edges":
+            # 场景 B：边的级联删除/创建 (Edge Cascades)
+            # 一条边为什么会变？
+            ref = row["before"] if row["before"] else row["after"]
+            
+            # 第一种可能：是因为绑在它身上的 path 被删了/新建了。
+            found_path = False
+            for p_uri, p_row in paths_by_string.items():
+                p_ref = p_row["before"] if p_row["before"] else p_row["after"]
+                if p_ref.get("edge_id") == ref["id"] and same_action(row, p_row):
+                    parent_map[key] = _make_row_key("paths", p_ref)
+                    found_path = True
+                    break
+            
+            # 第二种可能：如果是纯粹的结构性断裂（连 path 都没有），那是因为它的父节点被删了。
+            # 这时它去寻找连向它父节点（parent_uuid）的边是否也被删了。
+            if not found_path:
+                inc_edges = incoming_edges.get(ref["parent_uuid"], [])
+                for inc in inc_edges:
+                    if same_action(row, inc):
+                        parent_map[key] = _make_row_key("edges", inc["before"] if inc["before"] else inc["after"])
+                        break
+                        
+        elif row["table"] == "memories":
+            # 场景 C：记忆的垃圾回收 (Memory GC)
+            # 如果记忆被删除了（物理删除或废弃且无替代者），大概率是被 GC 的。
+            ref_b = row["before"]
+            ref_a = row["after"]
+            is_gc = False
+            
+            if is_deleted(row):
+                is_gc = True
+            elif ref_b and not ref_b.get("deprecated") and ref_a and ref_a.get("deprecated"):
+                # 检查是否只是常规的 update (有新的非废弃记忆补上)
+                node_uuid = ref_b["node_uuid"]
+                has_new_active = False
+                for r in changed_rows:
+                    if r["table"] == "memories":
+                        r_a = r.get("after")
+                        if r_a and r_a.get("node_uuid") == node_uuid and not r_a.get("deprecated") and r.get("before") is None:
+                            has_new_active = True
+                            break
+                if not has_new_active:
+                    is_gc = True
+            
+            # 如果确认是 GC 废弃，说明是由于节点失去所有入边引起的。
+            # 将这个记忆的变更，归因到指向该节点的边的被删上。
+            if is_gc:
+                node_uuid = (ref_b or ref_a)["node_uuid"]
+                inc_edges = incoming_edges.get(node_uuid, [])
+                for inc in inc_edges:
+                    if is_deleted(inc):
+                        parent_map[key] = _make_row_key("edges", inc["before"] if inc["before"] else inc["after"])
+                        break
+                        
+        elif row["table"] == "nodes":
+            # 场景 D：节点的级联删除
+            # 节点被物理删除，一定是因为连向它的所有边都被删了。
+            ref = row["before"] if row["before"] else row["after"]
+            inc_edges = incoming_edges.get(ref["uuid"], [])
+            for inc in inc_edges:
+                if same_action(row, inc):
+                    parent_map[key] = _make_row_key("edges", inc["before"] if inc["before"] else inc["after"])
+                    break
+
+    # =========================================================================
+    # 步骤 3：寻根问祖 (Resolve Roots)
+    # 通过 parent_map 不断往上找，直到找到没有父节点的最顶层根因，
+    # 拿这个根因的 node_uuid 作为当前行最终折叠进去的审核归属。
+    # =========================================================================
+    def get_root(k):
+        curr = k
+        visited = set()
+        while curr in parent_map and curr not in visited:
+            visited.add(curr)
+            curr = parent_map[curr]
+        return curr
+        
+    final_anchors = {}
+    for key in row_by_key:
+        root_key = get_root(key)
+        # 将行强行绑定到它最顶端原因所在的那个 node_uuid 上
+        final_anchors[key] = anchors[root_key]
+        
+    return final_anchors
 
 
-# ========== Diff: MEMORY snapshots ==========
-
-async def _diff_memory_content(snapshot: dict, resource_id: str) -> dict:
-    """Diff for memory content change. Rollback = rollback_to_memory.
-    
-    Old content is fetched from DB via memory_id (the deprecated Memory row
-    is preserved by the version chain).  If the old row was permanently
-    deleted, a fallback message is shown instead.
+@router.get("/groups", response_model=List[ChangeGroup])
+async def list_groups():
     """
+    List all pending changes, grouped by their top-level node_uuid.
+    
+    Returns a summarized list of ChangeGroups for the frontend sidebar. 
+    It dynamically groups rows, resolves URIs for display, and determines 
+    the highest-level table affected (node > memory > edge > path).
+    """
+    store = get_changeset_store()
+    all_rows_dict = store.get_all_rows_dict()
+    all_rows = list(all_rows_dict.values())
+    changed_rows = store.get_changed_rows()
+    
+    # Extract edge_ids from path rows that we need to resolve via live DB
+    # (i.e. edges that weren't modified in this changeset but their paths were)
+    edge_ids_to_resolve = set()
+    for row in changed_rows:
+        if row["table"] == "paths":
+            ref = row["before"] if row["before"] else row["after"]
+            if ref and ref.get("edge_id"):
+                found = False
+                for r in all_rows:
+                    if r["table"] == "edges":
+                        eref = r["before"] if r["before"] else r["after"]
+                        if eref and eref.get("id") == ref["edge_id"]:
+                            found = True
+                            break
+                if not found:
+                    edge_ids_to_resolve.add(ref["edge_id"])
+                    
+    # Bulk-resolve missing edge_ids to child_uuids via live DB
+    db_edge_to_node = {}
+    if edge_ids_to_resolve:
+        client = get_db_client()
+        from sqlalchemy import select
+        from db.sqlite_client import Edge
+        async with client.session() as session:
+            res = await session.execute(select(Edge.id, Edge.child_uuid).where(Edge.id.in_(edge_ids_to_resolve)))
+            for eid, child_uuid in res:
+                db_edge_to_node[eid] = child_uuid
+                
+    # Group all changed rows by their causal root node_uuid
+    anchors = _get_causal_anchors(changed_rows, all_rows, db_edge_to_node)
+    groups: Dict[str, List[Dict]] = {}
+    for row in changed_rows:
+        key = _make_row_key(row["table"], row["before"] if row["before"] else row["after"])
+        node_uuid = anchors.get(key)
+        if node_uuid:
+            groups.setdefault(node_uuid, []).append(row)
+            
+    result = []
+    # Rank tables to determine the most significant change for UI icon display
+    TABLE_RANK = {"nodes": 4, "memories": 3, "edges": 2, "paths": 1}
+    RANK_TO_TABLE = {4: "nodes", 3: "memories", 2: "edges", 1: "paths"}
+    
+    for node_uuid, rows in groups.items():
+        tables_present = {r["table"] for r in rows}
+        top_rank = max((TABLE_RANK[t] for t in tables_present), default=1)
+        top_table = RANK_TO_TABLE[top_rank]
+        
+        display_uri = None
+        # Attempt to find a display URI from path rows in the changeset (even unchanged ones)
+        for r in all_rows:
+            if r["table"] == "paths":
+                if _resolve_node_uuid_sync(r, all_rows, db_edge_to_node) == node_uuid:
+                    pref = r["before"] if r["before"] else r["after"]
+                    if pref:
+                        display_uri = f"{pref.get('domain', 'core')}://{pref.get('path', '')}"
+                        break
+        
+        # If no path is in the changeset, find the primary URI from the live DB
+        if not display_uri:
+            client = get_db_client()
+            from sqlalchemy import select
+            from db.sqlite_client import Path as PathModel, Edge
+            async with client.session() as session:
+                db_res = await session.execute(
+                    select(PathModel.domain, PathModel.path)
+                    .join(Edge, PathModel.edge_id == Edge.id)
+                    .where(Edge.child_uuid == node_uuid)
+                    .limit(1)
+                )
+                db_row = db_res.first()
+                if db_row:
+                    display_uri = f"{db_row[0]}://{db_row[1]}"
+                    
+        # Ultimate fallback for orphan nodes
+        if not display_uri:
+            display_uri = f"[unmapped]/{node_uuid}"
+            
+        result.append(ChangeGroup(
+            node_uuid=node_uuid,
+            display_uri=display_uri,
+            top_level_table=top_table,
+            row_count=len(rows)
+        ))
+        
+    return sorted(result, key=lambda x: x.display_uri)
+
+
+async def _extract_content_and_meta_for_node(rows: List[Dict[str, Any]], slot: str, node_uuid: str):
+    """
+    Extract memory content and edge metadata (priority, disclosure) for diff comparison.
+    
+    Memory content is huge, so it is NOT stored directly in the JSON changeset.
+    Instead, the changeset stores pointers (memory_id). This function extracts
+    those IDs and fetches the actual content/metadata from the live DB.
+    
+    Args:
+        rows: List of changeset rows for a specific node_uuid.
+        slot: Which state to extract ("before" or "after").
+        node_uuid: The parent node_uuid.
+    """
+    memory_id = None
+    meta = {"priority": None, "disclosure": None}
+    
+    # 1. Look for memory and edge metadata inside the provided rows
+    for row in rows:
+        data = row.get(slot)
+        if data is None:
+            continue
+        # Find the active (non-deprecated) memory ID
+        if row["table"] == "memories" and not data.get("deprecated", False):
+            memory_id = data.get("id")
+        # Find edge metadata
+        elif row["table"] == "edges":
+            meta["priority"] = data.get("priority")
+            meta["disclosure"] = data.get("disclosure")
+
+    content = None
     client = get_db_client()
-    
-    # --- Retrieve old content from DB instead of snapshot file ---
-    old_memory_id = snapshot["data"].get("memory_id")
-    old_version = await client.get_memory_version(old_memory_id) if old_memory_id else None
-    
-    if old_version:
-        old_content = old_version.get("content", "")
+
+    if memory_id is not None:
+        # If we found a memory pointer in the changeset, fetch its content from DB
+        mem = await client.get_memory_by_id(memory_id)
+        if mem:
+            content = mem.get("content")
     else:
-        old_content = "[已被永久删除，无法显示旧内容]"
-    
-    snapshot_data = {
-        "content": old_content,
-        "priority": None,
-        "disclosure": None
-    }
-    
-    # --- Retrieve current content via path (with alias fallback) ---
-    current_memory = await _get_memory_by_path_from_data(snapshot["data"])
-    
-    if not current_memory:
-        for alt_uri_str in snapshot["data"].get("all_paths", []):
-            if "://" in alt_uri_str:
-                alt_domain, alt_path = alt_uri_str.split("://", 1)
-            else:
-                alt_domain, alt_path = "core", alt_uri_str
-            orig_path = snapshot["data"].get("path")
-            orig_domain = snapshot["data"].get("domain", "core")
-            if alt_path == orig_path and alt_domain == orig_domain:
-                continue
-            current_memory = await client.get_memory_by_path(alt_path, alt_domain)
-            if current_memory:
-                break
-    
-    if not current_memory:
-        current_data = {"content": "[PATH DELETED]", "priority": None, "disclosure": None}
-    else:
-        current_data = {
-            "content": current_memory.get("content", ""),
-            "priority": None,
-            "disclosure": None
-        }
-    
-    unified, summary = _compute_diff(snapshot_data["content"], current_data.get("content", ""))
-    has_changes = snapshot_data["content"] != current_data.get("content", "")
-    
-    return {"snapshot_data": snapshot_data, "current_data": current_data,
-            "unified": unified, "summary": summary, "has_changes": has_changes}
+        # 2. Fallback: If no memory pointer was in the changeset (e.g. only paths changed),
+        # query the live DB for the currently active memory and edge of this node.
+        from sqlalchemy import select
+        from db.sqlite_client import Memory, Edge
+        async with client.session() as session:
+            if meta["priority"] is None:
+                edge = (await session.execute(select(Edge).where(Edge.child_uuid == node_uuid).limit(1))).scalar_one_or_none()
+                if edge:
+                    meta["priority"] = edge.priority
+                    meta["disclosure"] = edge.disclosure
+            
+            mem = (await session.execute(
+                select(Memory).where(Memory.node_uuid == node_uuid, Memory.deprecated == False)
+            )).scalar_one_or_none()
+            if mem:
+                content = mem.content
+
+    return content, meta
 
 
-# ========== Diff Endpoint ==========
-
-# Dispatch table: (resource_type, operation_type) → diff handler
-_DIFF_HANDLERS = {
-    ("path", "create"):       _diff_path_create,
-    ("path", "create_alias"): _diff_path_create_alias,
-    ("path", "delete"):       _diff_path_delete,
-    ("path", "modify_meta"):  _diff_path_modify_meta,
-    ("memory", "modify_content"): _diff_memory_content,
-}
-
-# Legacy compatibility: old snapshots used resource_type="memory" for everything
-_LEGACY_DIFF_HANDLERS = {
-    "create":       _diff_path_create,
-    "create_alias": _diff_path_create_alias,
-    "delete":       _diff_path_delete,
-    "modify":       _diff_memory_content,  # Old "modify" = content change
-}
-
-
-@router.get("/sessions/{session_id}/diff/{resource_id:path}", response_model=ResourceDiff)
-async def get_resource_diff(session_id: str, resource_id: str):
+@router.get("/groups/{node_uuid}/diff", response_model=UriDiff)
+async def get_group_diff(node_uuid: str):
     """
-    获取快照与当前状态的 diff
-
-    Handles both new split snapshots (path/memory) and legacy snapshots.
+    Compute the before vs after (current) diff for a specific node group.
+    
+    Used by the review UI to highlight content modifications or metadata changes.
     """
-    resource_id = unquote(resource_id)
+    store = get_changeset_store()
+    all_rows_dict = store.get_all_rows_dict()
+    all_rows = list(all_rows_dict.values())
+    changed_rows = store.get_changed_rows()
     
-    manager = get_snapshot_manager()
-    snapshot = manager.get_snapshot(session_id, resource_id)
+    # Re-run the edge_id resolution cache for this request
+    db_edge_to_node = {}
+    client = get_db_client()
+    from sqlalchemy import select
+    from db.sqlite_client import Edge
     
-    if not snapshot:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Snapshot for '{resource_id}' not found in session '{session_id}'"
-        )
+    edge_ids_to_resolve = set()
+    for row in changed_rows:
+        if row["table"] == "paths":
+            ref = row["before"] if row["before"] else row["after"]
+            if ref and ref.get("edge_id"):
+                edge_ids_to_resolve.add(ref["edge_id"])
     
-    resource_type = snapshot["resource_type"]
-    operation_type = snapshot["data"].get("operation_type", "modify")
+    if edge_ids_to_resolve:
+        async with client.session() as session:
+            res = await session.execute(select(Edge.id, Edge.child_uuid).where(Edge.id.in_(edge_ids_to_resolve)))
+            for eid, child_uuid in res:
+                db_edge_to_node[eid] = child_uuid
+
+    anchors = _get_causal_anchors(changed_rows, all_rows, db_edge_to_node)
+
+    # Filter all rows belonging to this node_uuid
+    rows = []
+    for row in changed_rows:
+        key = _make_row_key(row["table"], row["before"] if row["before"] else row["after"])
+        if anchors.get(key) == node_uuid:
+            rows.append(row)
+            
+    if not rows:
+        raise HTTPException(404, f"No changes for node '{node_uuid}'")
+
+    # Determine highest table rank to power the UI badge (e.g. "nodes changed")
+    tables_present = {r["table"] for r in rows}
+    TABLE_RANK = {"nodes": 4, "memories": 3, "edges": 2, "paths": 1}
+    RANK_TO_TABLE = {4: "nodes", 3: "memories", 2: "edges", 1: "paths"}
+    top_rank = max((TABLE_RANK[t] for t in tables_present), default=1)
+    top_table = RANK_TO_TABLE[top_rank]
+
+    # Extract text content and metadata for diff viewer
+    before_content, before_meta = await _extract_content_and_meta_for_node(rows, "before", node_uuid)
+    current_content, current_meta = await _extract_content_and_meta_for_node(rows, "after", node_uuid)
     
-    # Try new dispatch table first, then legacy fallback
-    handler = _DIFF_HANDLERS.get((resource_type, operation_type))
-    if not handler:
-        handler = _LEGACY_DIFF_HANDLERS.get(operation_type)
-    if not handler:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unknown snapshot type: {resource_type}/{operation_type}"
-        )
-    
-    result = await handler(snapshot, resource_id)
-    
-    return ResourceDiff(
-        resource_id=resource_id,
-        resource_type=resource_type,
-        snapshot_time=snapshot["snapshot_time"],
-        snapshot_data=result["snapshot_data"],
-        current_data=result["current_data"],
-        diff_unified=result["unified"],
-        diff_summary=result["summary"],
-        has_changes=result["has_changes"]
+    # If the "after" state wasn't fully captured in the snapshot (e.g. partial edits),
+    # use the actual live DB state as the absolute ground truth for current data.
+    if current_content is None and current_meta["priority"] is None:
+        async with client.session() as session:
+            from db.sqlite_client import Memory
+            mem = (await session.execute(
+                select(Memory).where(Memory.node_uuid == node_uuid, Memory.deprecated == False)
+            )).scalar_one_or_none()
+            if mem:
+                current_content = mem.content
+            edge = (await session.execute(select(Edge).where(Edge.child_uuid == node_uuid).limit(1))).scalar_one_or_none()
+            if edge:
+                current_meta["priority"] = edge.priority
+                current_meta["disclosure"] = edge.disclosure
+
+    has_changes = (before_content != current_content) or (before_meta != current_meta)
+
+    return UriDiff(
+        uri=node_uuid,
+        change_type=top_table,
+        before_content=before_content,
+        current_content=current_content,
+        before_meta=before_meta,
+        current_meta=current_meta,
+        has_changes=has_changes,
     )
 
 
-# ========== Rollback Helpers ==========
-
-async def _rollback_path(data: dict) -> dict:
-    """Rollback a path-level operation."""
-    client = get_db_client()
-    path = data.get("path")
-    domain = data.get("domain", "core")
-    operation_type = data.get("operation_type")
-    uri = data.get("uri", f"{domain}://{path}")
-    
-    if operation_type == "create":
-        # Rollback of create = delete the memory and path
-        current = await client.get_memory_by_path(path, domain)
-        if not current:
-            return {"deleted": True}
-        try:
-            await client.permanently_delete_memory(current["id"])
-            return {"deleted": True}
-        except ValueError as e:
-            raise HTTPException(status_code=409, detail=f"Cannot delete '{uri}': {e}")
-    
-    elif operation_type == "create_alias":
-        # Rollback of alias creation = remove the alias path only
-        try:
-            await client.remove_path(path, domain)
-        except ValueError:
-            pass  # Already removed
-        return {"deleted": True, "alias_removed": True}
-    
-    elif operation_type == "delete":
-        # Rollback of delete = restore the path
-        memory_id = data.get("memory_id")
-        
-        # Verify the target memory still exists in DB
-        target_version = await client.get_memory_version(memory_id) if memory_id else None
-        if not target_version:
-            raise HTTPException(
-                status_code=410,
-                detail=f"旧版本 (memory_id={memory_id}) 已被永久删除，无法恢复 '{uri}'。"
-            )
-        
-        try:
-            await client.restore_path(
-                path=path, domain=domain,
-                memory_id=memory_id,
-                priority=data.get("priority", data.get("importance", 0)),
-                disclosure=data.get("disclosure")
-            )
-            return {"restored": True, "new_version": memory_id}
-        except ValueError as e:
-            raise HTTPException(status_code=409, detail=f"Cannot restore '{uri}': {e}")
-    
-    elif operation_type == "modify_meta":
-        # Rollback of metadata change = restore original priority/disclosure
-        current = await client.get_memory_by_path(path, domain)
-        if not current:
-            raise HTTPException(status_code=404, detail=f"'{uri}' no longer exists")
-        
-        await client.update_memory(
-            path=path, domain=domain,
-            priority=data.get("priority", data.get("importance")),
-            disclosure=data.get("disclosure")
-        )
-        return {"metadata_restored": True}
-    
-    else:
-        raise HTTPException(status_code=400, detail=f"Unknown path operation: {operation_type}")
-
-
-async def _rollback_memory_content(data: dict) -> dict:
-    """Rollback a memory content change."""
-    client = get_db_client()
-    memory_id = data.get("memory_id")
-    path = data.get("path")
-    domain = data.get("domain", "core")
-    uri = data.get("uri", f"{domain}://{path}")
-    
-    if not memory_id:
-        raise HTTPException(status_code=400, detail="Snapshot missing memory_id")
-    
-    # Verify the target memory still exists in DB (not permanently deleted)
-    target_version = await client.get_memory_version(memory_id)
-    if not target_version:
-        raise HTTPException(
-            status_code=410,
-            detail=f"旧版本 (memory_id={memory_id}) 已被永久删除，无法回滚。"
-        )
-    
-    current = await client.get_memory_by_path(path, domain)
-    
-    # Fallback: if original path was deleted, try alternative paths from snapshot
-    if not current:
-        for alt_uri_str in data.get("all_paths", []):
-            if "://" in alt_uri_str:
-                alt_domain, alt_path = alt_uri_str.split("://", 1)
-            else:
-                alt_domain, alt_path = "core", alt_uri_str
-            if alt_path == path and alt_domain == domain:
-                continue  # Skip the one we already tried
-            current = await client.get_memory_by_path(alt_path, alt_domain)
-            if current:
-                path, domain = alt_path, alt_domain
-                break
-    
-    if not current:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Path '{uri}' no longer exists and no alternative paths found. Cannot rollback content."
-        )
-    
-    if memory_id == current.get("id"):
-        return {"no_change": True, "new_version": memory_id}
-    
-    result = await client.rollback_to_memory(path, memory_id, domain)
-    return {"new_version": result["restored_memory_id"]}
-
-
-async def _rollback_legacy_modify(data: dict) -> dict:
-    """Rollback for legacy 'modify' snapshots that combined content + metadata."""
-    client = get_db_client()
-    path = data.get("path")
-    domain = data.get("domain", "core")
-    uri = data.get("uri", f"{domain}://{path}")
-    snapshot_memory_id = data.get("memory_id")
-    
-    if not snapshot_memory_id:
-        raise HTTPException(status_code=400, detail="Snapshot missing memory_id")
-    
-    # Verify the target memory still exists in DB
-    target_version = await client.get_memory_version(snapshot_memory_id)
-    if not target_version:
-        raise HTTPException(
-            status_code=410,
-            detail=f"旧版本 (memory_id={snapshot_memory_id}) 已被永久删除，无法回滚。"
-        )
-    
-    current = await client.get_memory_by_path(path, domain)
-    if not current:
-        raise HTTPException(status_code=404, detail=f"'{uri}' no longer exists")
-    
-    has_version_change = snapshot_memory_id != current.get("id")
-    has_meta_change = (
-        data.get("priority", data.get("importance")) != current.get("priority") or
-        data.get("disclosure") != current.get("disclosure")
-    )
-    
-    if not has_version_change and not has_meta_change:
-        return {"no_change": True, "new_version": current.get("id")}
-    
-    restored_id = current.get("id")
-    
-    if has_version_change:
-        result = await client.rollback_to_memory(path, snapshot_memory_id, domain)
-        restored_id = result["restored_memory_id"]
-    
-    if has_meta_change:
-        await client.update_memory(
-            path=path, domain=domain,
-            priority=data.get("priority", data.get("importance")),
-            disclosure=data.get("disclosure")
-        )
-    
-    return {"new_version": restored_id}
-
-
-# ========== Rollback Endpoint ==========
-
-@router.post("/sessions/{session_id}/rollback/{resource_id:path}", response_model=RollbackResponse)
-async def rollback_resource(session_id: str, resource_id: str, request: RollbackRequest):
+@router.post("/groups/{node_uuid}/rollback", response_model=GroupRollbackResponse)
+async def rollback_group(node_uuid: str):
     """
-    执行回滚：将资源恢复到快照状态
-
-    路径快照 (resource_type="path"):
-    - create → 删除新创建的 memory 和 path
-    - create_alias → 移除别名路径
-    - delete → 恢复被删除的路径
-    - modify_meta → 恢复 priority/disclosure
-
-    内容快照 (resource_type="memory"):
-    - modify_content → 将 path 指回旧版本的 memory
+    Execute universal rollback for all changes under a specific node_uuid.
+    
+    This is a purely data-driven rollback:
+    1. If the node itself was created, cascade delete the whole node.
+    2. Otherwise, revert paths (delete new ones, restore deleted ones).
+    3. Revert edge metadata changes via simple UPDATE.
+    4. Revert memory content by reviving the old deprecated memory version.
+    
+    Finally, purges all related rows from the snapshot changeset.
     """
-    resource_id = unquote(resource_id)
+    store = get_changeset_store()
+    all_rows_dict = store.get_all_rows_dict()
+    all_rows = list(all_rows_dict.values())
+    changed_rows = store.get_changed_rows()
     
-    manager = get_snapshot_manager()
-    snapshot = manager.get_snapshot(session_id, resource_id)
+    db_edge_to_node = {}
+    client = get_db_client()
+    from sqlalchemy import select, update
+    from db.sqlite_client import Edge
     
-    if not snapshot:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Snapshot for '{resource_id}' not found in session '{session_id}'"
-        )
+    # Resolve edge_ids for path tracing
+    edge_ids_to_resolve = set()
+    for row in changed_rows:
+        if row["table"] == "paths":
+            ref = row["before"] if row["before"] else row["after"]
+            if ref and ref.get("edge_id"):
+                edge_ids_to_resolve.add(ref["edge_id"])
     
-    resource_type = snapshot["resource_type"]
-    data = snapshot["data"]
-    operation_type = data.get("operation_type", "modify")
-    
+    if edge_ids_to_resolve:
+        async with client.session() as session:
+            res = await session.execute(select(Edge.id, Edge.child_uuid).where(Edge.id.in_(edge_ids_to_resolve)))
+            for eid, child_uuid in res:
+                db_edge_to_node[eid] = child_uuid
+
+    anchors = _get_causal_anchors(changed_rows, all_rows, db_edge_to_node)
+
+    # Gather rows for this node
+    rows = []
+    keys_to_remove = []
+    for row in changed_rows:
+        key = _make_row_key(row["table"], row["before"] if row["before"] else row["after"])
+        if anchors.get(key) == node_uuid:
+            rows.append(row)
+            keys_to_remove.append(key)
+
+    if not rows:
+        raise HTTPException(404, f"No changes for '{node_uuid}'")
+
     try:
-        # Dispatch based on resource_type
-        if resource_type == "path":
-            result = await _rollback_path(data)
-        elif resource_type == "memory":
-            if operation_type == "modify_content":
-                result = await _rollback_memory_content(data)
-            elif operation_type == "modify":
-                # Legacy: old "modify" snapshots with resource_type="memory"
-                result = await _rollback_legacy_modify(data)
-            elif operation_type in ("create", "delete", "create_alias"):
-                # Legacy: old snapshots used resource_type="memory" for all operations
-                result = await _rollback_path(data)
+        messages = []
+        
+        async with client.session() as session:
+            # 1. The Ultimate Rollback: Node Creation.
+            # If the 'nodes' table has a row where 'before' is None, this node didn't exist before.
+            # Therefore, rolling back means wiping out the entire node and its cascades.
+            node_created = any(r["table"] == "nodes" and r["before"] is None for r in rows)
+            if node_created:
+                await client._cascade_delete_node(session, node_uuid)
+                messages.append("Deleted created node and its dependencies.")
             else:
-                raise HTTPException(status_code=400, detail=f"Unknown memory operation: {operation_type}")
-        else:
-            raise HTTPException(status_code=400, detail=f"Unknown resource type: {resource_type}")
-        
-        # Build response message
-        message = _build_rollback_message(resource_id, operation_type, result)
-        
-        return RollbackResponse(
-            resource_id=resource_id,
-            resource_type=resource_type,
-            success=True,
-            message=message,
-            new_version=result.get("new_version")
-        )
-        
-    except HTTPException:
-        raise
+                # Revert Path Changes by sorting lengths
+                path_rows = [r for r in rows if r["table"] == "paths"]
+                path_creations = [r for r in path_rows if r["before"] is None and r["after"] is not None]
+                path_creations.sort(key=lambda r: len(r["after"]["path"].split("/")), reverse=True) # remove children first
+                path_deletions = [r for r in path_rows if r["before"] is not None and r["after"] is None]
+                path_deletions.sort(key=lambda r: len(r["before"]["path"].split("/"))) # restore parents first
+                
+                # 2a. Remove created paths
+                for r in path_creations:
+                    try:
+                        await client.remove_path(r["after"]["path"], r["after"]["domain"], session=session)
+                        messages.append(f"Removed path '{r['after']['path']}'.")
+                    except ValueError as e:
+                        if "not found" not in str(e):
+                            raise e
+                        
+                # 2b. Restore deleted paths
+                for r in path_deletions:
+                    edge_id = r["before"].get("edge_id")
+                    edge_before = None
+                    
+                    # Try to find the original edge metadata from the changeset
+                    for er in rows:
+                        if er["table"] == "edges" and (er["before"] or {}).get("id") == edge_id:
+                            edge_before = er["before"]
+                            break
+                    
+                    parent_uuid = edge_before.get("parent_uuid") if edge_before else None
+                    child_uuid = edge_before.get("child_uuid") if edge_before else None
+                    priority = edge_before.get("priority", 0) if edge_before else 0
+                    disclosure = edge_before.get("disclosure") if edge_before else None
+                    
+                    # If edge wasn't deleted/changed, pull missing metadata from live DB
+                    if (parent_uuid is None or child_uuid is None) and edge_id:
+                        edge_db = (await session.execute(select(Edge).where(Edge.id == edge_id))).scalar_one_or_none()
+                        if edge_db:
+                            parent_uuid = edge_db.parent_uuid
+                            child_uuid = edge_db.child_uuid
+                            priority = edge_db.priority
+                            disclosure = edge_db.disclosure
+                                
+                    target_node_uuid = child_uuid or node_uuid
+                                
+                    await client.restore_path(
+                        path=r["before"]["path"],
+                        domain=r["before"]["domain"],
+                        node_uuid=target_node_uuid,
+                        parent_uuid=parent_uuid,
+                        priority=priority,
+                        disclosure=disclosure,
+                        session=session
+                    )
+                    messages.append(f"Restored path '{r['before']['path']}'.")
+
+                # 3. Revert Edge Metadata Changes (Priority / Disclosure)
+                for r in rows:
+                    if r["table"] == "edges" and r["before"] and r["after"]:
+                        old_p = r["before"].get("priority")
+                        old_d = r["before"].get("disclosure")
+                        # If properties changed, issue an explicit DB UPDATE to revert them
+                        if old_p != r["after"].get("priority") or old_d != r["after"].get("disclosure"):
+                            await session.execute(
+                                update(Edge).where(Edge.id == r["before"]["id"]).values(
+                                    priority=old_p, disclosure=old_d
+                                )
+                            )
+                            messages.append("Restored edge metadata.")
+
+                # 4. Revert Memory Content (Revive old deprecated memory version)
+                for r in rows:
+                    # Find the old memory row that was active ('deprecated' == False) before the changes
+                    if r["table"] == "memories" and r["before"] and not r["before"].get("deprecated"):
+                        old_active_mem_id = r["before"].get("id")
+                        try:
+                            # rollback_to_memory automatically deprecates the current memory
+                            # and un-deprecates the old one
+                            await client.rollback_to_memory(old_active_mem_id, session=session)
+                            messages.append(f"Restored previous memory content ({old_active_mem_id}).")
+                        except ValueError:
+                            pass
+
+        if not messages:
+            messages.append("No rollback action required.")
+
+        # 5. Clean up the changeset store
+        # Includes changed rows AND net-zero/unchanged rows that were linked to this group
+        for row in all_rows:
+            key = _make_row_key(row["table"], row["before"] if row["before"] else row["after"])
+            if key not in keys_to_remove: # Not already removed
+                if anchors.get(key) == node_uuid:
+                    keys_to_remove.append(key)
+                elif row not in changed_rows and _resolve_node_uuid_sync(row, all_rows, db_edge_to_node) == node_uuid:
+                    keys_to_remove.append(key)
+
+        store.remove_keys(keys_to_remove)
+
+        return GroupRollbackResponse(node_uuid=node_uuid, success=True, message=" ".join(messages))
     except Exception as e:
-        return RollbackResponse(
-            resource_id=resource_id,
-            resource_type=resource_type,
-            success=False,
-            message=f"Rollback failed: {str(e)}",
-            new_version=None
-        )
+        return GroupRollbackResponse(node_uuid=node_uuid, success=False, message=f"Rollback failed: {e}")
 
 
-def _build_rollback_message(resource_id: str, operation_type: str, result: dict) -> str:
-    """Generate a human-readable rollback result message."""
-    if result.get("no_change"):
-        return "No changes detected. Already matches snapshot."
-    
-    messages = {
-        "create":         f"Deleted created resource '{resource_id}'.",
-        "create_alias":   f"Removed alias '{resource_id}'.",
-        "delete":         f"Restored deleted resource '{resource_id}'.",
-        "modify_meta":    f"Restored metadata for '{resource_id}'.",
-        "modify_content": f"Restored content to snapshot version (memory_id={result.get('new_version')}).",
-        "modify":         f"Restored to snapshot version (memory_id={result.get('new_version')}).",
-    }
-    
-    return messages.get(operation_type, f"Rollback completed for '{resource_id}'.")
-
-
-@router.delete("/sessions/{session_id}/snapshots/{resource_id:path}")
-async def delete_snapshot(session_id: str, resource_id: str):
+@router.delete("/groups/{node_uuid}")
+async def approve_group(node_uuid: str):
     """
-    删除指定的快照（确认不需要回滚后）
+    Approve changes for a node group.
+    
+    This does not touch the DB; it simply clears the tracked rows from the
+    changeset JSON, indicating the human has reviewed and accepted them.
     """
-    # Ensure resource_id is decoded
-    resource_id = unquote(resource_id)
+    store = get_changeset_store()
+    all_rows_dict = store.get_all_rows_dict()
+    all_rows = list(all_rows_dict.values())
+    changed_rows = store.get_changed_rows()
     
-    manager = get_snapshot_manager()
-    deleted = manager.delete_snapshot(session_id, resource_id)
+    db_edge_to_node = {}
+    client = get_db_client()
+    from sqlalchemy import select
+    from db.sqlite_client import Edge
     
-    if not deleted:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Snapshot for '{resource_id}' not found in session '{session_id}'"
-        )
+    edge_ids_to_resolve = set()
+    for row in changed_rows:
+        if row["table"] == "paths":
+            ref = row["before"] if row["before"] else row["after"]
+            if ref and ref.get("edge_id"):
+                edge_ids_to_resolve.add(ref["edge_id"])
     
-    return {"message": f"Snapshot for '{resource_id}' deleted"}
+    if edge_ids_to_resolve:
+        async with client.session() as session:
+            res = await session.execute(select(Edge.id, Edge.child_uuid).where(Edge.id.in_(edge_ids_to_resolve)))
+            for eid, child_uuid in res:
+                db_edge_to_node[eid] = child_uuid
 
+    anchors = _get_causal_anchors(changed_rows, all_rows, db_edge_to_node)
 
-@router.delete("/sessions/{session_id}")
-async def clear_session(session_id: str):
-    """
-    清除整个 session 的所有快照
-    
-    当 human 确认所有修改都 OK 后调用此端点清理。
-    """
-    manager = get_snapshot_manager()
-    count = manager.clear_session(session_id)
-    
+    keys_to_remove = []
+    for row in all_rows:
+        key = _make_row_key(row["table"], row["before"] if row["before"] else row["after"])
+        if anchors.get(key) == node_uuid:
+            keys_to_remove.append(key)
+        elif row not in changed_rows and _resolve_node_uuid_sync(row, all_rows, db_edge_to_node) == node_uuid:
+            keys_to_remove.append(key)
+
+    count = store.remove_keys(keys_to_remove)
     if count == 0:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Session '{session_id}' not found or already empty"
-        )
-    
-    return {"message": f"Session '{session_id}' cleared, {count} snapshots deleted"}
+        raise HTTPException(404, f"No changes for '{node_uuid}'")
+    return {"message": f"Approved node '{node_uuid}' ({count} rows cleared)"}
 
 
-# ========== Deprecated Memory Management (Human Only) ==========
+@router.delete("")
+async def clear_all():
+    """Approve/Integrate all pending changes globally by emptying the changeset."""
+    store = get_changeset_store()
+    count = store.clear_all()
+    if count == 0:
+        raise HTTPException(404, "No pending changes")
+    return {"message": f"All changes integrated ({count} row changes cleared)"}
+
 
 @router.get("/deprecated")
 async def list_deprecated_memories():
-    """
-    列出所有被标记为 deprecated 的记忆
-    
-    这些是 AI 更新/删除后留下的旧版本，等待 human 审核后永久删除。
-    """
+    """List memories that have been replaced by newer versions."""
     client = get_db_client()
-    
-    try:
-        memories = await client.get_deprecated_memories()
-        return {
-            "count": len(memories),
-            "memories": memories
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    memories = await client.get_deprecated_memories()
+    return {"count": len(memories), "memories": memories}
 
 
 @router.delete("/memories/{memory_id}")
 async def permanently_delete_memory(memory_id: int):
-    """
-    永久删除一条记忆（human 专用）
-    
-    这是真正的删除操作，不可恢复。
-    AI 无法调用此接口（仅限 human 通过前端操作）。
-    """
+    """Permanently purge a deprecated memory from the DB (manual GC)."""
     client = get_db_client()
-    
     try:
         await client.permanently_delete_memory(memory_id)
         return {"message": f"Memory {memory_id} permanently deleted"}
     except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(404, str(e))
 
-
-# ========== Utility Endpoints ==========
 
 @router.post("/diff", response_model=DiffResponse)
 async def compare_text(request: DiffRequest):
-    """
-    比较两个文本并返回diff
-
-    Args:
-        request: 包含text_a和text_b
-
-    Returns:
-        DiffResponse: 包含diff_html, diff_unified, summary
-    """
-    try:
-        diff_html, diff_unified, summary = get_text_diff(
-            request.text_a,
-            request.text_b
-        )
-        return DiffResponse(
-            diff_html=diff_html,
-            diff_unified=diff_unified,
-            summary=summary
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    """Generic text diffing utility for the frontend."""
+    diff_html, diff_unified, summary = get_text_diff(request.text_a, request.text_b)
+    return DiffResponse(diff_html=diff_html, diff_unified=diff_unified, summary=summary)
